@@ -1,45 +1,58 @@
 #include "../xtm_api.h"
 #include <time.h>
+
+#define _GNU_SOURCE
 #include <pthread.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <float.h>
-#include "lua.h"
-#include "lauxlib.h"
-#include "module.h"
+#include <math.h>
+#include "tarantool/lua.h"
+#include "tarantool/lauxlib.h"
+#include "tarantool/module.h"
 
 struct ppq_t {
 	struct xtm_queue *tx2net;
 	struct xtm_queue *net2tx;
 
 	pthread_t net_thread;
+	lua_State *L;
 
 	int is_running;
 };
 
 struct ppq_message_t {
+	struct ppq_t *q;
 	uint64_t id;
-	double ctime;
+	uint64_t otime;
+	uint64_t ctime;
 };
+
+static uint64_t now() {
+	static struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return ts.tv_sec*1e9 + ts.tv_nsec;
+}
 
 static struct ppq_message_t* newmsg(uint64_t id) {
 	struct ppq_message_t *msg = malloc(sizeof(struct ppq_message_t));
-
-	struct timespec now;
-	clock_gettime(CLOCK_REALTIME, &now);
-
 	msg->id = id;
-	msg->ctime = now.tv_sec + now.tv_nsec/1e9;
+	msg->otime = msg->ctime = now();
 	return msg;
 }
+
+static void tx_consumer_func(void *);
 
 static void *net_worker_f(void *arg) {
 	struct ppq_t *q = (struct ppq_t *) arg;
 
+	pthread_setname_np(pthread_self(), "xtmnet");
+
 	q->tx2net = xtm_create(1024);
 	int tx2net_fd = xtm_fd(q->tx2net);
 
+	fprintf(stderr, "[net] xtm created tx2net_fd: %d\n", tx2net_fd);
 	__atomic_store_n(&q->is_running, 1, __ATOMIC_RELEASE);
 
 	while (__atomic_load_n(&q->is_running, __ATOMIC_ACQUIRE) == 1) {
@@ -49,14 +62,36 @@ static void *net_worker_f(void *arg) {
 
 		int rc = select(tx2net_fd+1, &readset, NULL, NULL, NULL);
 		if (rc < 0) {
+			fprintf(stderr, "[net] select: %s", strerror(errno));
 			continue;
 		}
 
 		if (FD_ISSET(tx2net_fd, &readset)) {
-			assert(xtm_fun_invoke_all(q->net2tx) == 0);
+			assert(xtm_fun_invoke_all(q->tx2net) == 0);
 		}
 	}
+
+	fprintf(stderr, "[net] Leaving\n");
 	return NULL;
+}
+
+static void net_consumer_func(void *arg) {
+	struct ppq_message_t *msg = (struct ppq_message_t*) arg;
+	// fprintf(stderr, "[net] id: %lu; lat: %.4fs; otime: %.4fs\n", msg->id, now()-msg->ctime, msg->otime);
+
+	struct ppq_t *q = msg->q;
+	msg->ctime = now();
+	int net2tx_fd = xtm_fd(q->net2tx);
+
+	// Reply back:
+	while (xtm_msg_probe(q->net2tx) != 0) {
+		fd_set wset;
+		FD_ZERO(&wset);
+		FD_SET(net2tx_fd, &wset);
+
+		int rc = select(net2tx_fd+1, NULL, &wset, NULL, NULL);
+	}
+	assert(xtm_fun_dispatch(q->net2tx, tx_consumer_func, msg, 0) == 0);
 }
 
 /**
@@ -89,6 +124,64 @@ static int new(lua_State *L) {
 	return 1;
 }
 
+static void tx_consumer_func(void *arg) {
+	struct ppq_message_t *msg = (struct ppq_message_t*) arg;
+	// fprintf(stderr, "[tx] msg: %ld lat: %.4fs otime: %.4fs\n", msg->id, now()-msg->ctime, msg->otime);
+
+	struct ppq_t *q = msg->q;
+	double received_at = now();
+
+	if (lua_gettop(q->L) > 1) {
+		lua_pop(q->L, lua_gettop(q->L)-1);
+	}
+	assert(lua_gettop(q->L) == 1);
+
+	// module table:
+	luaL_checktype(q->L, 1, LUA_TTABLE);
+	lua_pushstring(q->L, "on_ctx");
+	lua_gettable(q->L, -2); // t.on_ctx
+
+	if (lua_isfunction(q->L, -1)) {
+		lua_pushvalue(q->L, 1); // arg[1] = L[1] (module table)
+		lua_createtable(q->L, 0, 7); // arg[2] = x = {} (message table)
+
+		lua_pushstring(q->L, "id");
+		lua_pushinteger(q->L, msg->id);
+		lua_settable(q->L, -3); // x.id = msg->id
+
+		lua_pushstring(q->L, "ack");
+		lua_pushnumber(q->L, (received_at-msg->ctime)/1e3);
+		lua_settable(q->L, -3);
+
+		lua_pushstring(q->L, "syn");
+		lua_pushnumber(q->L, (msg->ctime-msg->otime)/1e3);
+		lua_settable(q->L, -3);
+
+		lua_pushstring(q->L, "rtt");
+		lua_pushnumber(q->L, (received_at-msg->otime)/1e3);
+		lua_settable(q->L, -3);
+
+		lua_pushstring(q->L, "otime");
+		lua_pushnumber(q->L, msg->otime);
+		lua_settable(q->L, -3);
+
+		lua_pushstring(q->L, "ftime");
+		lua_pushnumber(q->L, received_at);
+		lua_settable(q->L, -3);
+
+		lua_pushstring(q->L, "rtime");
+		lua_pushnumber(q->L, msg->ctime);
+		lua_settable(q->L, -3);
+
+		int r = lua_pcall(q->L, 2, 0, 0); // executes pcall, passes 2 arguments, receives zero
+		if (r != 0) {
+			fprintf(stderr, "[tx] on_ctx failed: %d\n", r);
+		}
+	}
+
+	free(msg);
+}
+
 /**
  * Pushes message to the queue
  */
@@ -108,15 +201,21 @@ static int send(lua_State *L) {
 		luaL_error(L, "ppq:run() lost q");
 	}
 
+	double ctime = now();
 	struct ppq_message_t *msg = newmsg((uint64_t) msg_id);
+	msg->q = q;
 
-	// if (xtm_msg_probe(q->tx2net) == 0) {
-	// 	assert(xtm_fun_dispatch(q->tx2net, net_consumer_func, msg, 0) == 0);
-	// } else {
-	// 	luaL_error(L, "ppq failed: %s", strerror(errno));
-	// }
+	// fprintf(stderr, "[tx] send id: %lu otime: %.4fs\n", msg->id, msg->otime);
 
-	lua_pushboolean(L, 1);
+	int tx2net_fd = xtm_fd(q->tx2net);
+	while(xtm_msg_probe(q->tx2net) != 0) {
+		if ((coio_wait(tx2net_fd, COIO_WRITE, DBL_MAX) & COIO_WRITE) == 0) {
+			luaL_error(L, "coio_wait failed");
+		}
+	}
+	assert(xtm_fun_dispatch(q->tx2net, net_consumer_func, msg, 0) == 0);
+
+	lua_pushnumber(L, now() - ctime);
 	return 1;
 }
 
@@ -129,6 +228,8 @@ static int run(lua_State *L) {
 	if (q == NULL) {
 		luaL_error(L, "ppq:run() lost q");
 	}
+
+	q->L = L;
 
 	// 1. Create xtm_queue
 	q->net2tx = xtm_create(1024);
