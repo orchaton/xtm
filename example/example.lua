@@ -1,4 +1,4 @@
-require'jit'.off()
+require 'jit'.off()
 
 local clock = require 'clock'
 local ffi = require 'ffi'
@@ -21,7 +21,7 @@ local module = {
 	}),
 }
 
-module.mod.callback = function(arg)
+function module.mod.callback(arg)
 	if arg ~= 0 then
 		arg = ffi.cast('struct message_t *', arg)
 		print("cb:", arg.sync, clock.time()-arg.time)
@@ -71,7 +71,7 @@ module.th = thread.new(function(mod_addr)
 
 	print("finished")
 	return 0
-end, require'glue'.addr(ffi.cast('void *', module.mod)))
+end, require 'glue'.addr(ffi.cast('void *', module.mod)))
 
 ffi.cdef[[
 	static const int COIO_READ = 0x01;
@@ -80,7 +80,7 @@ ffi.cdef[[
 	int coio_wait(int fd, int event, double timeout);
 ]]
 
-module.tx_fiber = require'fiber'.create(function(mod)
+module.tx_fiber = require 'fiber'.create(function(mod)
 	mod.ev:wait()
 	local in_fd = xtm.xtm_fd(mod.xtm_tx)
 	for _ = 1, 1e3 do

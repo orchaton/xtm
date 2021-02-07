@@ -1,6 +1,7 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.0)
 
-add_subdirectory(perf)
+#add_subdirectory(perf)
+add_subdirectory(test)
 
 set(xtm_api_sources
     xtm_api.cc
